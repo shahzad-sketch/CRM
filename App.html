@@ -1,0 +1,696 @@
+<script>
+/* =============================================================================
+ *  App.html – single-page web app. Talks to the server only through api(action, payload).
+ *  Screens are generated from the server SCHEMA, so new columns appear automatically.
+ * ============================================================================= */
+let B = null;               // bootstrap data (user, perms, schema, lookups, options)
+const DYN = {};             // dynamic option lists fetched on demand (PUR_PO, SITE_MR, ...)
+const AUDIT_COLS = ['CREATED_AT', 'CREATED_BY', 'UPDATED_AT', 'UPDATED_BY'];
+const $ = (s, el) => (el || document).querySelector(s);
+const $$ = (s, el) => Array.from((el || document).querySelectorAll(s));
+const esc = v => String(v === undefined || v === null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/* ---------------------------------------------------------------- server */
+const READ_ACTIONS = ['bootstrap', 'dashboard', 'pendingApprovals', 'list', 'getDoc', 'options', 'projectOverview', 'prLinesForPo',
+  'poLinesForGrn', 'transferLines', 'mrLinesForIssue', 'issuedLines', 'warm'];
+const SEEN = new Map();     // screen data already shown once: re-shown instantly, then refreshed in the background
+function forgetSeen() {
+  SEEN.clear();
+  Object.keys(DYN).forEach(k => { delete DYN[k]; const d = document.getElementById('dl_' + k); if (d) d.remove(); });
+}
+/* ---- session token (kept in this browser until logout) */
+const Store = {
+  mem: '',
+  get() { try { return localStorage.getItem('ims_token') || this.mem; } catch (e) { return this.mem; } },
+  set(t) { this.mem = t; try { localStorage.setItem('ims_token', t); } catch (e) { } },
+  clear() { this.mem = ''; try { localStorage.removeItem('ims_token'); } catch (e) { } }
+};
+const isAuthError = m => /^(SESSION_EXPIRED|LOGIN_REQUIRED)/.test(String(m || ''));
+
+function call(action, payload, quiet) {
+  if (READ_ACTIONS.indexOf(action) < 0) forgetSeen();   // something changed – never show old data after a save
+  if (!quiet) UI.busy(true);
+  return new Promise((resolve, reject) => {
+    google.script.run
+      .withSuccessHandler(r => {
+        UI.busy(false);
+        if (r && r.ok) return resolve(r.data);
+        if (r && isAuthError(r.error)) { r.auth = true; Auth.expired(r.error.replace(/^\w+:\s*/, '')); return reject(r); }
+        UI.toast(r ? r.error : 'No response', true); reject(r);
+      })
+      .withFailureHandler(e => { UI.busy(false); UI.toast(e.message || String(e), true); reject(e); })
+      .api(action, payload || {}, Store.get());
+  });
+}
+
+/**
+ * Show cached data for this screen immediately (if any), then fetch fresh data and re-render only if it changed.
+ * render(data, fresh) is called once or twice. Returns a promise of the fresh data.
+ */
+function fastCall(action, payload, render) {
+  const key = action + '|' + JSON.stringify(payload || {});
+  const old = SEEN.get(key);
+  if (old) render(old.data, false);
+  return call(action, payload, true).then(data => {
+    const json = JSON.stringify(data);
+    SEEN.set(key, { data, json });
+    if (!old || old.json !== json) render(data, true);
+    return data;
+  });
+}
+
+/* ---------------------------------------------------------------- UI helpers */
+const UI = {
+  busyN: 0,
+  busy(on) { this.busyN += on ? 1 : -1; if (this.busyN < 0) this.busyN = 0; $('#busy').classList.toggle('hidden', this.busyN === 0); },
+  toast(msg, err) { const d = document.createElement('div'); d.className = err ? 'err' : ''; d.textContent = msg; $('#toast').appendChild(d); setTimeout(() => d.remove(), err ? 9000 : 4000); },
+  modal(title, html) { $('#mtitle').textContent = title; $('#mbody').innerHTML = html; $('#modal').classList.remove('hidden'); fillDynamic($('#mbody')); },
+  close() { $('#modal').classList.add('hidden'); $('#mbody').innerHTML = ''; },
+  view(title, html) { $('#title').textContent = title; $('#view').innerHTML = html; fillDynamic($('#view')); document.body.classList.remove('navopen'); }
+};
+
+const can = (module, p) => B.perms === 'ALL' || ((B.perms[module] || '').indexOf(p) >= 0);
+const sheetDef = s => B.schema[s];
+const colDef = (sheet, name) => { const d = sheetDef(sheet); return d ? d.cols.find(c => c.n === name) : null; };
+
+function fmt(v, t) {
+  if (v === '' || v === null || v === undefined) return '';
+  if ((t === 'CURRENCY' || t === 'NUMBER' || t === 'PCT') && !isNaN(Number(v)))
+    return Number(v).toLocaleString('en-IN', { maximumFractionDigits: t === 'CURRENCY' ? 2 : 3 });
+  return esc(v);
+}
+function chip(v) {
+  const s = String(v || '');
+  const cls = /APPROVED|RECEIVED|COMPLETED|ISSUED|POSTED|OK|ACTIVE|PASSED|CLOSED|FULLY|ACKNOWLEDGED|^Y$/.test(s) ? 'ok'
+    : /PENDING|PARTIAL|DRAFT|SUBMITTED|LOW|IN PROGRESS|IN TRANSIT|OPEN|MATERIAL/.test(s) ? 'warn'
+    : /REJECT|CANCEL|OUT|FAILED|SUPERSEDED|INACTIVE|HOLD|^N$/.test(s) ? 'bad' : 'info';
+  return `<span class="chip ${cls}">${esc(s)}</span>`;
+}
+const isStatusCol = n => /STATUS$|^IS_|^HAS_|_CLEARED$|_CLOSED$|_COMPLETED$|_RELEASED$/.test(n);
+
+/* ---------------------------------------------------------------- menu */
+const MENU = [
+  { g: 'Overview', c: '#5eead4', items: [['dashboard', 'Dashboard'], ['approvals', 'My approvals']] },
+  { g: '01 · Masters', s: '01', m: 'MASTERS', items: [['support', '⟳ Sync Support sheet'], ['supportopen', 'Open Support sheet ↗'], ['list:MST_PRODUCT', 'Products'], ['list:MST_SUPPLIER', 'Suppliers'], ['list:MST_SUPPLIER_PRICE', 'Supplier price list'], ['list:MST_LOCATION', 'Locations'], ['list:MST_USER', 'Users'], ['list:MST_CATEGORY', 'Categories'], ['list:MST_SUBCATEGORY', 'Sub-categories'], ['list:MST_UOM', 'Units (UOM)'], ['list:MST_WORK_STAGE', 'Work stages'], ['list:MST_ROLE_PERMISSION', 'Role permissions']] },
+  { g: '02 · Projects', s: '02', m: 'PROJECT', items: [['list:PRJ_PROJECT', 'Projects'], ['list:PRJ_STAGE', 'Stage plan (all)']] },
+  { g: '03 · BOM', s: '03', m: 'BOM', items: [['list:BOM_HEADER', 'BOM list'], ['doc:BOM', 'New BOM / revision'], ['list:BOM_ITEMS', 'BOM lines']] },
+  { g: '04 · Allocation', s: '04', m: 'ALLOCATION', items: [['list:PRJ_ALLOCATION', 'Stock allocations']] },
+  { g: '05 · Procurement', s: '05', m: 'PURCHASE_REQUEST', items: [['list:PUR_PR', 'Purchase requests'], ['doc:PR', 'New PR'], ['list:PUR_QUOTATION', 'Quotations'], ['list:PUR_PO', 'Purchase orders', 'PURCHASE_ORDER'], ['doc:PO', 'New PO', 'PURCHASE_ORDER']] },
+  { g: '06 · Receipt', s: '06', m: 'GRN', items: [['list:GRN_HEADER', 'GRN list'], ['doc:GRN', 'New GRN'], ['list:PUR_RETURN', 'Returns to vendor']] },
+  { g: '07 · Inventory', s: '07', m: 'INVENTORY', items: [['list:INV_STOCK', 'Current stock'], ['list:INV_LEDGER', 'Stock ledger'], ['doc:OPENING', 'Opening stock'], ['list:INV_TRANSFER', 'Transfers'], ['doc:TRANSFER', 'New transfer'], ['doc:RECEIVE_TRANSFER', 'Receive transfer'], ['list:INV_ADJUSTMENT', 'Adjustments'], ['doc:ADJUST', 'Physical count']] },
+  { g: '08 · Site', s: '08', m: 'SITE_REQUEST', items: [['list:SITE_MR', 'Material requests'], ['doc:MR', 'New material request'], ['list:SITE_ISSUE', 'Issues', 'SITE_ISSUE_RETURN'], ['doc:ISSUE', 'Issue material', 'SITE_ISSUE_RETURN'], ['list:SITE_RETURN', 'Returns', 'SITE_ISSUE_RETURN'], ['doc:RETURN', 'Return from site', 'SITE_ISSUE_RETURN'], ['list:SITE_WASTAGE', 'Wastage', 'WASTAGE_USAGE'], ['act:WASTAGE', 'Report wastage', 'WASTAGE_USAGE'], ['list:SITE_USAGE_LOG', 'Usage log', 'WASTAGE_USAGE'], ['doc:USAGE', 'Log daily usage', 'WASTAGE_USAGE']] },
+  { g: '09 · Closure & reports', s: '09', m: 'REPORTS', items: [['report:RPT_BOM_VS_ACTUAL', 'BOM vs actual (stage-wise)'], ['report:RPT_PROJECT_COST', 'Project cost'], ['report:RPT_STOCK_MOVEMENT', 'Stock movement'], ['list:PRJ_CLOSURE', 'Project closures', 'CLOSURE']] },
+  { g: 'Settings', s: '00', m: 'SETTINGS', items: [['list:SYS_CONFIG', 'Config'], ['list:SYS_LOOKUP', 'Dropdown lists'], ['list:SYS_APPROVAL_MATRIX', 'Approval matrix'], ['list:SYS_SEQUENCE', 'ID sequences'], ['list:SYS_AUDIT_LOG', 'Audit log'], ['cache', 'Clear cache']] }
+];
+
+function renderMenu() {
+  $('#menu').innerHTML = MENU.map(grp => {
+    const items = grp.items.filter(it => !grp.m || can(it[2] || grp.m, 'V'));
+    if (!items.length) return '';
+    const color = grp.c || `var(--s${grp.s})`;
+    return `<div class="grp"><div><i style="background:${color}"></i>${esc(grp.g)}</div>` +
+      items.map(it => `<a data-r="${it[0]}" onclick="go('${it[0]}')">${esc(it[1])}</a>`).join('') + '</div>';
+  }).join('');
+}
+
+function go(route, arg) {
+  Screens._cur = route; Screens._ls = null;
+  $$('#menu a').forEach(a => a.classList.toggle('on', a.dataset.r === route));
+  const [kind, key] = route.split(':');
+  if (kind === 'dashboard') return Screens.dashboard();
+  if (kind === 'approvals') return Screens.approvals();
+  if (kind === 'list') return Screens.list(key, arg);
+  if (kind === 'report') return Screens.report(key, arg);
+  if (kind === 'doc') return Screens.doc(key, arg);
+  if (kind === 'act') return Screens.actionForm(key, arg);
+  if (kind === 'project') return Screens.project(key);
+  if (kind === 'support') return call('syncSupport').then(r => { UI.toast(r.message || 'Support sheet synced'); return boot(true); }).then(() => go('list:MST_CATEGORY'));
+  if (kind === 'supportopen') { if (B.config.SUPPORT_URL) window.open(B.config.SUPPORT_URL, '_blank'); return; }
+  if (kind === 'cache') return call('clearCache').then(() => UI.toast('Cache cleared – reloading masters')).then(boot);
+}
+
+/* ---------------------------------------------------------------- fields */
+function optionsFor(c, sheet) {
+  const ref = (c.ref || '').trim();
+  let m = ref.match(/^SYS_LOOKUP\((.+)\)$/);
+  if (m) return (B.lookups[m[1]] || []).map(v => ({ v, l: v }));
+  if (B.options[ref]) return B.options[ref];
+  if (c.t === 'Y/N') return [{ v: 'Y', l: 'Y' }, { v: 'N', l: 'N' }];
+  const fromText = s => s && /^[A-Z_][A-Z_ ]*( \/ [A-Z_][A-Z_ ]*)+$/.test(s) ? s.split(' / ').map(v => ({ v: v.trim(), l: v.trim() })) : null;
+  return fromText(ref) || fromText(c.d) || null;
+}
+const DYN_REFS = ['PUR_PO', 'SITE_MR', 'INV_TRANSFER', 'BOM_HEADER', 'PUR_PR_ITEMS', 'GRN_ITEMS', 'SITE_ISSUE_ITEMS'];
+
+function field(c, value, opts) {
+  opts = opts || {};
+  const name = c.n, v = value === undefined || value === null ? '' : value;
+  const ro = opts.readonly ? 'disabled' : '';
+  const ref = (c.ref || '').trim();
+  let input;
+  if (DYN_REFS.indexOf(ref) >= 0 && !opts.readonly) {
+    input = `<input data-name="${name}" data-dyn="${ref}" list="dl_${ref}" value="${esc(v)}" placeholder="type or pick…">`;
+  } else {
+    const o = optionsFor(c);
+    const SELECT_ALWAYS = ['MST_CATEGORY', 'MST_SUBCATEGORY', 'MST_UOM'];
+    if (o && (ref === 'MST_PRODUCT' || (o.length > 25 && SELECT_ALWAYS.indexOf(ref) < 0))) {
+      const cur = o.find(x => String(x.v) === String(v));
+      ensureDatalist(ref, o);
+      input = `<input data-name="${name}" data-list="1" data-ref="${esc(ref)}" list="dl_${esc(ref)}" value="${esc(cur ? cur.l : v)}" ${ro} placeholder="${ref === 'MST_PRODUCT' ? 'type product name…' : 'type to search…'}">`;
+    } else if (o && (o.length || /^MST_/.test(ref))) {   // empty Support list → plain text box instead of an empty dropdown
+      input = `<select data-name="${name}" ${ro}><option value=""></option>` + o.map(x => `<option value="${esc(x.v)}" ${String(x.v) === String(v) ? 'selected' : ''}>${esc(x.l)}</option>`).join('') + '</select>';
+    } else if (c.t === 'DATE') input = `<input type="date" data-name="${name}" value="${esc(String(v).slice(0, 10))}" ${ro}>`;
+    else if (c.t === 'DATETIME') input = `<input type="datetime-local" data-name="${name}" value="${esc(String(v).replace(' ', 'T'))}" ${ro}>`;
+    else if (['NUMBER', 'CURRENCY', 'PCT'].indexOf(c.t) >= 0) input = `<input type="number" step="any" data-name="${name}" value="${esc(v)}" ${ro}>`;
+    else input = `<input data-name="${name}" value="${esc(v)}" ${ro}>`;
+  }
+  if (opts.bare) return input;
+  return `<div class="fld"><label title="${esc(c.d)}">${esc(name.replace(/_/g, ' '))}${c.r === 'Y' ? ' <span class="req">*</span>' : ''}</label>${input}${opts.hint ? `<small>${esc(opts.hint)}</small>` : ''}</div>`;
+}
+function datalist(ref, o) {
+  if (document.getElementById('dl_' + ref)) return '';
+  return `<datalist id="dl_${esc(ref)}">` + o.map(x => `<option value="${esc(x.l)}"></option>`).join('') + '</datalist>';
+}
+function ensureDatalist(ref, o) {
+  if (!document.getElementById('dl_' + ref)) document.body.insertAdjacentHTML('beforeend', datalist(ref, o));
+}
+/** After masters are reloaded, rebuild the suggestion lists used by inputs already on screen. */
+function refreshDatalists() {
+  $$('input[data-ref]').forEach(e => { const o = optionsFor({ n: e.dataset.name, ref: e.dataset.ref, t: 'TEXT' }); if (o) ensureDatalist(e.dataset.ref, o); });
+}
+/** Product form: sub-category list follows the chosen category (both come from the Support sheet). */
+function linkCategory(root) {
+  const cat = $('[data-name=CATEGORY_ID]', root), sub = $('[data-name=SUBCATEGORY_ID]', root);
+  if (!cat || !sub || sub.tagName !== 'SELECT') return;
+  const fill = () => {
+    const cur = sub.value, list = (B.options.MST_SUBCATEGORY || []).filter(x => !cat.value || x.p === cat.value);
+    sub.innerHTML = '<option value=""></option>' + list.map(x => `<option value="${esc(x.v)}" ${x.v === cur ? 'selected' : ''}>${esc(x.l)}</option>`).join('');
+  };
+  cat.addEventListener('change', fill); fill();
+}
+function fillDynamic(root) {
+  const refs = Array.from(new Set($$('[data-dyn]', root).map(e => e.dataset.dyn)));
+  refs.forEach(ref => {
+    const put = list => ensureDatalist(ref, list);
+    if (DYN[ref]) return put(DYN[ref]);
+    call('options', { ref }, true).then(list => { DYN[ref] = list; put(list); });
+  });
+}
+/** Read [data-name] inputs into an object. Datalist values "ID — label" -> ID. */
+function collect(root) {
+  const o = {};
+  $$('[data-name]', root).forEach(e => {
+    let v = e.value;
+    if (e.dataset.list && v) {   // label shown to the user → stored value (e.g. product name → PRODUCT_ID)
+      const hit = (optionsFor({ n: e.dataset.name, ref: e.dataset.ref, t: 'TEXT' }) || []).find(x => x.l === v.trim());
+      if (hit) v = hit.v; else if (v.indexOf(' — ') > 0) v = v.split(' — ')[0].trim();   // unknown name → server maps it
+    } else if (e.dataset.dyn && v.indexOf(' — ') > 0) v = v.split(' — ')[0].trim();
+    if (e.type === 'datetime-local' && v) v = v.replace('T', ' ');
+    if (e.dataset.keep !== undefined) v = e.dataset.keep;
+    o[e.dataset.name] = typeof v === 'string' ? v.trim() : v;
+  });
+  return o;
+}
+
+/* ---------------------------------------------------------------- tables */
+function table(cols, rows, opts) {
+  opts = opts || {};
+  if (!rows.length) return `<div class="card muted">No records${opts.empty ? ' – ' + esc(opts.empty) : ''}.</div>`;
+  const types = {};
+  cols.forEach(c => { const d = opts.sheet && colDef(opts.sheet, c); types[c] = d ? d.t : (opts.types && opts.types[c]) || ''; });
+  return `<div class="tbl-wrap"><table><thead><tr>${cols.map(c => `<th>${esc(c.replace(/_/g, ' '))}</th>`).join('')}${opts.actions ? '<th></th>' : ''}</tr></thead><tbody>` +
+    rows.map((r, i) => `<tr class="${opts.onRow ? 'click' : ''}" data-i="${i}">` + cols.map(c => {
+      const t = types[c], v = r[c];
+      if (isStatusCol(c) && v !== '' && v !== undefined) return `<td>${chip(v)}</td>`;
+      const num = ['NUMBER', 'CURRENCY', 'PCT'].indexOf(t) >= 0 || (typeof v === 'number');
+      const cls = num ? 'num' + (/VARIANCE/.test(c) && Number(v) > 0 ? ' neg' : /VARIANCE/.test(c) && Number(v) < 0 ? ' pos' : '') : '';
+      return `<td class="${cls}">${fmt(v, t || (typeof v === 'number' ? 'NUMBER' : ''))}</td>`;
+    }).join('') + (opts.actions ? `<td style="white-space:nowrap">${opts.actions(r, i)}</td>` : '') + '</tr>').join('') + '</tbody></table></div>';
+}
+function bindRows(root, rows, fn) { $$('tr.click', root).forEach(tr => tr.addEventListener('click', e => { if (e.target.closest('button')) return; fn(rows[+tr.dataset.i]); })); }
+
+/* ---------------------------------------------------------------- config of screens */
+const LIST_COLS = {
+  PRJ_PROJECT: ['PROJECT_ID', 'PROJECT_NAME', 'CLIENT_NAME', 'PROJECT_TYPE', 'CITY', 'CURRENT_STAGE_CODE', 'MATERIAL_BUDGET', 'PROJECT_STATUS'],
+  BOM_HEADER: ['BOM_ID', 'PROJECT_ID', 'BOM_VERSION', 'BOM_TYPE', 'PREPARED_DATE', 'TOTAL_LINES', 'TOTAL_ESTIMATED_COST', 'BOM_STATUS', 'IS_CURRENT'],
+  PUR_PR: ['PR_ID', 'PR_DATE', 'PR_SOURCE', 'PROJECT_ID', 'REQUIRED_DATE', 'PRIORITY', 'ESTIMATED_VALUE', 'PR_STATUS'],
+  PUR_PO: ['PO_ID', 'PO_DATE', 'SUPPLIER_ID', 'PROJECT_ID', 'EXPECTED_DELIVERY', 'GRAND_TOTAL', 'PO_STATUS'],
+  GRN_HEADER: ['GRN_ID', 'GRN_DATE', 'PO_ID', 'SUPPLIER_ID', 'INVOICE_NO', 'RECEIVED_LOCATION_ID', 'INSPECTION_STATUS', 'GRN_STATUS'],
+  INV_STOCK: ['PRODUCT_ID', 'PRODUCT_NAME', 'LOCATION_ID', 'UOM', 'ON_HAND_QTY', 'ALLOCATED_QTY', 'AVAILABLE_QTY', 'ON_ORDER_QTY', 'AVG_RATE', 'STOCK_VALUE', 'REORDER_STATUS'],
+  INV_LEDGER: ['TXN_ID', 'TXN_DATE', 'TXN_TYPE', 'REF_ID', 'PRODUCT_ID', 'LOCATION_ID', 'PROJECT_ID', 'STAGE_CODE', 'IN_QTY', 'OUT_QTY', 'UNIT_RATE', 'TXN_VALUE'],
+  SITE_MR: ['MR_ID', 'MR_DATE', 'PROJECT_ID', 'STAGE_CODE', 'REQUIRED_DATE', 'PRIORITY', 'HAS_EXTRA_TO_BOM', 'MR_STATUS'],
+  SITE_ISSUE: ['ISSUE_ID', 'ISSUE_DATE', 'PROJECT_ID', 'STAGE_CODE', 'FROM_LOCATION_ID', 'ISSUED_TO', 'ISSUE_VALUE', 'ISSUE_STATUS'],
+  SITE_RETURN: ['RETURN_ID', 'RETURN_DATE', 'PROJECT_ID', 'STAGE_CODE', 'RETURNED_BY', 'TO_LOCATION_ID', 'REASON', 'RETURN_STATUS'],
+  SITE_WASTAGE: ['WASTE_ID', 'WASTE_DATE', 'WASTE_SOURCE', 'PROJECT_ID', 'STAGE_CODE', 'PRODUCT_NAME', 'WASTE_QTY', 'WASTE_TYPE', 'WASTE_COST', 'IS_WITHIN_ALLOWANCE', 'WASTE_STATUS'],
+  RPT_BOM_VS_ACTUAL: ['PROJECT_ID', 'STAGE_CODE', 'PRODUCT_NAME', 'UOM', 'BOM_GROSS_QTY', 'ALLOCATED_QTY', 'PO_QTY', 'RECEIVED_QTY', 'ISSUED_QTY', 'RETURNED_QTY', 'WASTAGE_QTY', 'USED_QTY', 'SITE_BALANCE_QTY', 'BALANCE_TO_ISSUE', 'QTY_VARIANCE', 'BOM_COST', 'ACTUAL_COST', 'COST_VARIANCE']
+};
+/* what "New" opens for a list */
+const NEW_FOR = { BOM_HEADER: 'doc:BOM', PUR_PR: 'doc:PR', PUR_PO: 'doc:PO', GRN_HEADER: 'doc:GRN', SITE_MR: 'doc:MR', SITE_ISSUE: 'doc:ISSUE',
+  SITE_RETURN: 'doc:RETURN', SITE_USAGE_LOG: 'doc:USAGE', INV_TRANSFER: 'doc:TRANSFER', INV_ADJUSTMENT: 'doc:ADJUST', SITE_WASTAGE: 'act:WASTAGE',
+  PUR_QUOTATION: 'act:QUOTE', PUR_RETURN: 'act:RTV' };
+const EDITABLE = ['SYS_CONFIG', 'SYS_LOOKUP', 'SYS_APPROVAL_MATRIX', 'MST_USER', 'MST_ROLE_PERMISSION', 'MST_LOCATION', 'MST_CATEGORY', 'MST_SUBCATEGORY',
+  'MST_UOM', 'MST_WORK_STAGE', 'MST_PRODUCT', 'MST_SUPPLIER', 'MST_SUPPLIER_PRICE', 'PRJ_PROJECT'];
+const DOC_SHEETS = ['BOM_HEADER', 'PUR_PR', 'PUR_PO', 'GRN_HEADER', 'INV_TRANSFER', 'SITE_MR', 'SITE_ISSUE', 'SITE_RETURN'];
+
+/* Document entry screens (header + lines). flat = payload is {...header, items} */
+const DOCS = {
+  BOM: { title: 'New BOM / revision', action: 'saveBom', hs: 'BOM_HEADER', hf: ['BOM_ID', 'PROJECT_ID', 'BOM_TYPE', 'DRAWING_REF', 'REVISION_REASON', 'REMARKS'], is: 'BOM_ITEMS',
+    itf: ['STAGE_CODE', 'AREA', 'ELEMENT', 'PRODUCT_ID', 'NET_QTY', 'WASTAGE_PCT', 'EST_RATE', 'MATERIAL_SOURCE', 'REMARKS'], ro: ['BOM_ID'],
+    hint: 'Quantities in the product stock unit. Blank WASTAGE % / EST RATE = product defaults. GROSS QTY = NET × (1 + wastage%), rounded up for whole-number units. Saving again on an existing project without BOM ID creates a new version (REVISION REASON required).',
+    done: r => go('list:BOM_HEADER') },
+  PR: { title: 'New purchase request', action: 'createPr', hs: 'PUR_PR', hf: ['PROJECT_ID', 'DEPARTMENT', 'REQUIRED_DATE', 'PRIORITY', 'REASON'], is: 'PUR_PR_ITEMS',
+    itf: ['STAGE_CODE', 'PRODUCT_ID', 'REQUESTED_QTY', 'REQUIRED_DATE', 'REMARKS'], hint: 'Qty in stock unit. BOM shortages are raised automatically from Project → Plan BOM.', done: r => go('list:PUR_PR') },
+  PO: { title: 'New purchase order', action: 'createPo', hs: 'PUR_PO', hf: ['SUPPLIER_ID', 'PROJECT_ID', 'DELIVERY_LOCATION_ID', 'PAYMENT_TERMS', 'EXPECTED_DELIVERY', 'FREIGHT', 'REMARKS'], is: 'PUR_PO_ITEMS',
+    itf: ['PR_ITEM_ID', 'PROJECT_ID', 'STAGE_CODE', 'PRODUCT_ID', 'ORDERED_QTY', 'UNIT_RATE', 'DISCOUNT_PCT', 'GST_PCT', 'EXPECTED_DATE'], ro: ['PR_ITEM_ID'],
+    loader: { label: 'Load approved PR lines', action: 'prLinesForPo', from: ['SUPPLIER_ID', 'PROJECT_ID'] },
+    hint: 'Qty & rate in PURCHASE unit. Rates come from the selected quotation, then the supplier price list, then the standard rate.', done: r => go('list:PUR_PO') },
+  GRN: { title: 'Goods receipt (GRN)', action: 'postGrn', hs: 'GRN_HEADER', hf: ['PO_ID', 'INVOICE_NO', 'INVOICE_DATE', 'INVOICE_AMOUNT', 'CHALLAN_NO', 'VEHICLE_NO', 'RECEIVED_LOCATION_ID', 'INSPECTED_BY', 'ATTACHMENT_URL'], is: 'GRN_ITEMS',
+    itf: ['PO_ITEM_ID', 'PRODUCT_ID', 'RECEIVED_QTY', 'ACCEPTED_QTY', 'REJECTION_REASON', 'BIN_LOCATION', 'BATCH_NO', 'SERIAL_NO', 'EXPIRY_DATE'], ro: ['PO_ITEM_ID', 'PRODUCT_ID'], info: ['PENDING'],
+    loader: { label: 'Load PO lines', action: 'poLinesForGrn', from: ['PO_ID'], required: true }, noAdd: true,
+    hint: 'Only ACCEPTED qty enters stock. Rejected qty creates a draft return-to-vendor automatically.', done: r => go('list:GRN_HEADER') },
+  MR: { title: 'Material request from site', action: 'createMr', hs: 'SITE_MR', hf: ['PROJECT_ID', 'STAGE_CODE', 'REQUIRED_DATE', 'PRIORITY', 'REMARKS'], is: 'SITE_MR_ITEMS',
+    itf: ['PRODUCT_ID', 'REQUESTED_QTY', 'EXTRA_REASON'], hint: 'Qty in stock unit. Anything above the BOM balance for this stage needs EXTRA REASON and approval.', done: r => go('list:SITE_MR') },
+  ISSUE: { title: 'Issue material to project stage', action: 'issueMaterial', hs: 'SITE_ISSUE', hf: ['MR_ID', 'PROJECT_ID', 'STAGE_CODE', 'FROM_LOCATION_ID', 'ISSUED_TO', 'PURPOSE'], is: 'SITE_ISSUE_ITEMS',
+    itf: ['MR_ITEM_ID', 'PRODUCT_ID', 'ISSUED_QTY', 'BATCH_NO', 'SERIAL_NO'], ro: ['MR_ITEM_ID'],
+    loader: { label: 'Load MR lines', action: 'mrLinesForIssue', from: ['MR_ID'], header: true },
+    hint: 'Qty in ISSUE unit. Without an approved MR you can issue up to BOM + tolerance only.', done: r => go('list:SITE_ISSUE') },
+  RETURN: { title: 'Return from site', action: 'createReturn', hs: 'SITE_RETURN', hf: ['PROJECT_ID', 'STAGE_CODE', 'RETURNED_BY', 'TO_LOCATION_ID', 'REASON'], is: 'SITE_RETURN_ITEMS',
+    itf: ['ISSUE_ITEM_ID', 'PRODUCT_ID', 'RETURNED_QTY', 'CONDITION', 'USABLE_QTY', 'DAMAGED_QTY'], ro: ['ISSUE_ITEM_ID', 'PRODUCT_ID'], info: ['RETURNABLE'],
+    loader: { label: 'Load issued lines', action: 'issuedLines', from: ['PROJECT_ID', 'STAGE_CODE'], required: true }, noAdd: true,
+    hint: 'USABLE qty goes back to stock; DAMAGED qty is booked as site wastage.', done: r => go('list:SITE_RETURN') },
+  USAGE: { title: 'Daily usage (installed qty)', action: 'logUsage', hs: 'SITE_USAGE_LOG', hf: ['PROJECT_ID', 'STAGE_CODE', 'USAGE_DATE'], is: 'SITE_USAGE_LOG',
+    itf: ['AREA', 'ELEMENT', 'PRODUCT_ID', 'USED_QTY', 'WORK_DONE', 'PHOTO_URL'], hint: 'What was actually consumed/installed today, per stage.',
+    done: r => { (r.warnings || []).forEach(w => UI.toast(w, true)); go('list:SITE_USAGE_LOG'); } },
+  TRANSFER: { title: 'Dispatch stock transfer', action: 'dispatchTransfer', hs: 'INV_TRANSFER', hf: ['FROM_LOCATION_ID', 'TO_LOCATION_ID', 'PROJECT_ID', 'VEHICLE_NO'], is: 'INV_TRANSFER_ITEMS',
+    itf: ['PRODUCT_ID', 'DISPATCHED_QTY', 'BATCH_NO', 'REMARKS'], done: r => go('list:INV_TRANSFER') },
+  RECEIVE_TRANSFER: { title: 'Receive transfer', action: 'receiveTransfer', flat: true, hs: 'INV_TRANSFER_ITEMS', hf: ['TRANSFER_ID'], is: 'INV_TRANSFER_ITEMS',
+    itf: ['TRANSFER_ITEM_ID', 'PRODUCT_ID', 'DISPATCHED_QTY', 'RECEIVED_QTY'], ro: ['TRANSFER_ITEM_ID', 'PRODUCT_ID', 'DISPATCHED_QTY'],
+    loader: { label: 'Load transfer lines', action: 'transferLines', from: ['TRANSFER_ID'], required: true }, noAdd: true, done: r => go('list:INV_TRANSFER') },
+  ADJUST: { title: 'Physical count / adjustment', action: 'createAdjustment', flat: true, hs: 'INV_ADJUSTMENT', hf: ['LOCATION_ID'], is: 'INV_ADJUSTMENT',
+    itf: ['PRODUCT_ID', 'PHYSICAL_QTY', 'REASON'], hint: 'Enter what you counted. The difference to system stock goes for approval before it posts.', done: r => go('list:INV_ADJUSTMENT') },
+  OPENING: { title: 'Opening stock', action: 'postOpening', flat: true, hs: 'INV_ADJUSTMENT', hf: ['LOCATION_ID'], is: '_X',
+    itf: ['PRODUCT_ID', 'QTY', 'UNIT_RATE'], cols: { QTY: { n: 'QTY', t: 'NUMBER', r: 'Y' }, UNIT_RATE: { n: 'UNIT_RATE', t: 'CURRENCY', d: 'Blank = standard rate' } },
+    hint: 'One-time load of existing stock per location (qty in stock unit).', done: r => go('list:INV_STOCK') }
+};
+
+/* Single-record action forms */
+const ACTS = {
+  WASTAGE: { title: 'Report wastage', action: 'reportWastage', sheet: 'SITE_WASTAGE', fields: ['WASTE_SOURCE', 'PROJECT_ID', 'STAGE_CODE', 'ISSUE_ITEM_ID', 'LOCATION_ID', 'PRODUCT_ID', 'WASTE_QTY', 'WASTE_TYPE', 'REASON', 'PHOTO_URL'],
+    hint: 'SITE = material already issued (cost only). STORE = damaged in warehouse (stock goes out after approval).', done: () => go('list:SITE_WASTAGE') },
+  QUOTE: { title: 'Add vendor quotation', action: 'addQuote', sheet: 'PUR_QUOTATION', fields: ['PR_ITEM_ID', 'SUPPLIER_ID', 'QUOTED_QTY', 'QUOTED_RATE', 'GST_PCT', 'FREIGHT', 'LEAD_TIME_DAYS', 'VALID_TILL', 'ATTACHMENT_URL'], done: () => go('list:PUR_QUOTATION') },
+  RTV: { title: 'Return accepted stock to vendor', action: 'createRtv', sheet: 'PUR_RETURN', fields: ['GRN_ITEM_ID', 'RETURN_QTY', 'REASON', 'DEBIT_NOTE_NO'], hint: 'Qty in stock unit. Stock goes out immediately.', done: () => go('list:PUR_RETURN') }
+};
+
+/* ---------------------------------------------------------------- screens */
+const Screens = {
+  dashboard() {
+    if (!SEEN.has('dashboard|{}')) UI.view('Dashboard', '<div class="loading">Loading…</div>');
+    return fastCall('dashboard', {}, d => { if (Screens._cur === 'dashboard') Screens.renderDashboard(d); });
+  },
+  renderDashboard(d) {
+    const cur = B.config.CURRENCY || '';
+    UI.view('Dashboard', `
+      <div class="kpis">
+        <div class="kpi"><span>Active projects</span><b>${d.activeProjects}</b></div>
+        <div class="kpi"><span>Stock value (${esc(cur)})</span><b>${fmt(d.stockValue, 'CURRENCY')}</b></div>
+        <div class="kpi"><span>Open purchase orders</span><b>${d.openPOs}</b></div>
+        <div class="kpi" style="cursor:pointer" onclick="go('approvals')"><span>Waiting for my approval</span><b>${d.pendingApprovals}</b></div>
+      </div>
+      <div class="card"><h3>Active projects</h3><div id="dp"></div></div>
+      <div class="card"><h3>Low / out of stock</h3>${table(['PRODUCT_ID', 'PRODUCT_NAME', 'LOCATION_ID', 'ON_HAND_QTY', 'REORDER_LEVEL', 'REORDER_STATUS'], d.lowStock, { empty: 'all good' })}</div>`);
+    $('#dp').innerHTML = table(['PROJECT_ID', 'PROJECT_NAME', 'CLIENT_NAME', 'CURRENT_STAGE_CODE', 'MATERIAL_BUDGET', 'PROJECT_STATUS'], d.projects, { sheet: 'PRJ_PROJECT', onRow: 1, empty: 'sync leads from Projects' });
+    bindRows($('#dp'), d.projects, r => go('project:' + r.PROJECT_ID));
+  },
+
+  approvals() {
+    if (!SEEN.has('pendingApprovals|{}')) UI.view('My approvals', '<div class="loading">Loading…</div>');
+    return fastCall('pendingApprovals', {}, rows => { if (Screens._cur === 'approvals') Screens.renderApprovals(rows); });
+  },
+  renderApprovals(rows) {
+    UI.view('My approvals', `<p class="hint">Only documents your role can approve are shown (SYS_APPROVAL_MATRIX / role permissions).</p>` +
+      table(['doc', 'id', 'date', 'project', 'value', 'note', 'status'], rows, { onRow: 1, types: { value: 'CURRENCY' }, empty: 'nothing waiting',
+        actions: (r, i) => `<button class="primary" onclick="Actions.approve('${r.doc}','${r.id}',true)">Approve</button> <button class="danger" onclick="Actions.approve('${r.doc}','${r.id}',false)">Reject</button>` }));
+    const map = { USER: 'MST_USER', BOM: 'BOM_HEADER', PR: 'PUR_PR', PO: 'PUR_PO', MR: 'SITE_MR', WASTAGE: 'SITE_WASTAGE', ADJUSTMENT: 'INV_ADJUSTMENT', CLOSURE: 'PRJ_CLOSURE' };
+    bindRows($('#view'), rows, r => Actions.open(map[r.doc], r.id));
+  },
+
+  async list(sheet, filters) {
+    const def = sheetDef(sheet), title = (MENU.flatMap(g => g.items).find(i => i[0] === 'list:' + sheet) || [0, sheet])[1];
+    const st = Screens._ls = { sheet, filters: Object.assign({}, filters || {}), search: '' };
+    const hasProject = def.cols.some(c => c.n === 'PROJECT_ID') && sheet !== 'PRJ_PROJECT';
+    const newRoute = NEW_FOR[sheet] || (EDITABLE.indexOf(sheet) >= 0 ? 'form' : '');
+    const extra = sheet === 'PRJ_PROJECT' ? `<button onclick="Actions.syncLeads()">⟳ Sync closed leads</button>` : '';
+    UI.view(title, `<div class="bar">
+        <input id="q" placeholder="Search…" style="max-width:260px" onkeydown="if(event.key==='Enter')Screens.reloadList()">
+        ${hasProject ? `<div style="width:260px">${field({ n: 'PROJECT_ID', ref: 'PRJ_PROJECT', t: 'TEXT' }, st.filters.PROJECT_ID || '', { bare: 1 })}</div>` : ''}
+        <button onclick="Screens.reloadList()">Search</button><span class="grow"></span>${extra}
+        ${newRoute && can(def.module, 'C') ? `<button class="primary" onclick="${newRoute === 'form' ? `Actions.form('${sheet}')` : `go('${newRoute}')`}">+ New</button>` : ''}
+      </div><div id="lst"><div class="loading">Loading…</div></div>`);
+    const pf = $('#view [data-name=PROJECT_ID]'); if (pf) pf.addEventListener('change', () => Screens.reloadList());
+    Screens.reloadList();
+  },
+  async reloadList() {
+    const st = Screens._ls, def = sheetDef(st.sheet);
+    st.search = ($('#q') || {}).value || '';
+    const pf = $('#view .bar [data-name=PROJECT_ID]');
+    if (pf) { const v = collect(pf.parentElement).PROJECT_ID; if (v) st.filters.PROJECT_ID = v; else delete st.filters.PROJECT_ID; }
+    const payload = { sheet: st.sheet, filters: Object.assign({}, st.filters), search: st.search };
+    return fastCall('list', payload, res => { if (Screens._ls === st && $('#lst')) Screens.renderList(st, def, res); });
+  },
+  renderList(st, def, res) {
+    const cols = LIST_COLS[st.sheet] || res.cols.filter(c => AUDIT_COLS.indexOf(c) < 0).slice(0, 11);
+    $('#lst').innerHTML = `<p class="hint">${res.total} record(s)${res.total > res.rows.length ? ', showing newest ' + res.rows.length : ''} · sheet <b>${st.sheet}</b> in <b>${esc(B.stageFiles[def.stage])}</b></p>` +
+      table(cols, res.rows, { sheet: st.sheet, onRow: 1 });
+    bindRows($('#lst'), res.rows, r => st.sheet === 'PRJ_PROJECT' ? go('project:' + r.PROJECT_ID) : Actions.open(st.sheet, def.pk ? r[def.pk] : null, r));
+  },
+
+  async report(sheet, filters) {
+    await Screens.list(sheet, filters);
+    $('.bar .grow').insertAdjacentHTML('afterend', `<button class="primary" onclick="Actions.rebuild()">⟳ Rebuild reports now</button>`);
+  },
+
+  /* ---- document entry (header + lines) */
+  doc(key, preset) {
+    const D = DOCS[key]; preset = preset || {};
+    const hdef = n => (D.cols && D.cols[n]) || colDef(D.hs, n) || colDef(D.is, n) || { n, t: 'TEXT' };
+    const head = D.hf.map(n => field(n === 'TRANSFER_ID' ? Object.assign({}, hdef(n), { ref: 'INV_TRANSFER' }) : hdef(n), (preset.header || {})[n],
+      { readonly: (D.ro || []).indexOf(n) >= 0 })).join('');
+    UI.view(D.title, `<div class="card"><div class="grid" id="dh">${head}</div>
+        ${D.hint ? `<p class="hint">${esc(D.hint)}</p>` : ''}
+        ${D.loader ? `<button onclick="Screens.loadLines('${key}')">⇣ ${esc(D.loader.label)}</button>` : ''}
+      </div>
+      <div class="card"><h3>Lines</h3><div class="tbl-wrap"><table class="lines"><thead><tr>${(D.info || []).concat(D.itf).map(n => `<th>${esc(n.replace(/_/g, ' '))}</th>`).join('')}<th></th></tr></thead><tbody id="dl"></tbody></table></div>
+        <p>${D.noAdd ? '' : `<button onclick="Screens.addLine('${key}')">+ Add line</button>`}
+        ${D.itf.indexOf('PRODUCT_ID') >= 0 && can('MASTERS', 'C') && (D.ro || []).indexOf('PRODUCT_ID') < 0 ? `<button onclick="Actions.form('MST_PRODUCT')">+ New product</button>` : ''}</p></div>
+      <div class="bar"><span class="grow"></span><button onclick="go('dashboard')">Cancel</button><button class="primary" onclick="Screens.submitDoc('${key}')">Save</button></div>`);
+    Screens._doc = { key, rows: [] };
+    (preset.items || (D.noAdd ? [] : [{}, {}, {}])).forEach(r => Screens.addLine(key, r));
+    if (preset.autoload) Screens.loadLines(key);
+  },
+  addLine(key, r) {
+    const D = DOCS[key]; r = r || {};
+    const idef = n => (D.cols && D.cols[n]) || colDef(D.is, n) || { n, t: 'TEXT' };
+    const tr = document.createElement('tr');
+    tr.innerHTML = (D.info || []).map(n => `<td class="ro">${fmt(r[n], 'NUMBER')}</td>`).join('') + D.itf.map(n => {
+      if ((D.ro || []).indexOf(n) >= 0) {
+        const o = n === 'PRODUCT_ID' ? (B.options.MST_PRODUCT.find(x => x.v === r[n]) || {}).l : '';
+        return `<td class="ro"><span data-name="${n}" data-keep="${esc(r[n])}">${esc(o || r[n] || '')}</span></td>`;
+      }
+      return `<td style="min-width:${n === 'PRODUCT_ID' ? 260 : /QTY|PCT|RATE/.test(n) ? 90 : 130}px">${field(idef(n), r[n], { bare: 1 })}</td>`;
+    }).join('') + `<td><button class="icon" title="remove" onclick="this.closest('tr').remove()">✕</button></td>`;
+    $('#dl').appendChild(tr);
+    fillDynamic(tr);
+  },
+  async loadLines(key) {
+    const D = DOCS[key], h = collect($('#dh')), p = {};
+    D.loader.from.forEach(n => { if (h[n]) p[n] = h[n]; });
+    if (D.loader.required && D.loader.from.some(n => !p[n] && n !== 'STAGE_CODE')) return UI.toast('Fill ' + D.loader.from.join(' / ') + ' first', true);
+    const res = await call(D.loader.action, p);
+    const items = D.loader.header ? res.items : res;
+    if (D.loader.header) Object.keys(res.header).forEach(k => { const e = $(`#dh [data-name=${k}]`); if (e) setVal(e, k, res.header[k]); });
+    $('#dl').innerHTML = '';
+    items.forEach(r => Screens.addLine(key, r));
+    UI.toast(items.length + ' line(s) loaded');
+  },
+  async submitDoc(key) {
+    const D = DOCS[key], header = collect($('#dh'));
+    const items = $$('#dl tr').map(tr => collect(tr)).filter(r => Object.keys(r).some(k => r[k] !== '' && D.itf.indexOf(k) >= 0 && (D.ro || []).indexOf(k) < 0));
+    if (!items.length) return UI.toast('Add at least one line', true);
+    const payload = D.flat ? Object.assign({}, header, { items }) : { header, items };
+    const r = await call(D.action, payload);
+    UI.toast('Saved ' + Object.values(r).filter(v => typeof v === 'string').join(' '));
+    D.done(r);
+  },
+
+  actionForm(key, preset) {
+    const A = ACTS[key]; preset = preset || {};
+    UI.view(A.title, `<div class="card"><div class="grid" id="af">${A.fields.map(n => field(colDef(A.sheet, n) || { n, t: 'TEXT' }, preset[n])).join('')}</div>
+      ${A.hint ? `<p class="hint">${esc(A.hint)}</p>` : ''}
+      ${A.fields.indexOf('PRODUCT_ID') >= 0 && can('MASTERS', 'C') ? `<button onclick="Actions.form('MST_PRODUCT')">+ New product</button>` : ''}</div>
+      <div class="bar"><span class="grow"></span><button class="primary" onclick="Screens.submitAct('${key}')">Save</button></div>`);
+  },
+  async submitAct(key) {
+    const A = ACTS[key], r = await call(A.action, collect($('#af')));
+    UI.toast('Saved ' + Object.values(r).filter(v => typeof v === 'string').join(' '));
+    A.done(r);
+  },
+
+  /* ---- project 360 */
+  project(pid) {
+    if (!SEEN.has('projectOverview|' + JSON.stringify({ PROJECT_ID: pid }))) UI.view('Project ' + pid, '<div class="loading">Loading…</div>');
+    return fastCall('projectOverview', { PROJECT_ID: pid }, o => { if (Screens._cur === 'project:' + pid) Screens.renderProject(o); });
+  },
+  renderProject(o) {
+    const p = o.project;
+    const cost = o.stages.reduce((a, s) => a + (Number(s.ACTUAL_COST) || 0), 0);
+    const statuses = B.lookups.STAGE_STATUS || [];
+    UI.view(`${p.PROJECT_ID} · ${p.PROJECT_NAME}`, `
+      <div class="kv">${['CLIENT_NAME', 'PROJECT_TYPE', 'CITY', 'PROJECT_STATUS', 'CURRENT_BOM_ID', 'CLOSURE_DATE', 'TARGET_END_DATE'].map(k => `<div><span>${k.replace(/_/g, ' ')}</span>${isStatusCol(k) ? chip(p[k]) : esc(p[k])}</div>`).join('')}</div>
+      <div class="kpis">
+        <div class="kpi"><span>Material budget (BOM)</span><b>${fmt(p.MATERIAL_BUDGET, 'CURRENCY')}</b></div>
+        <div class="kpi"><span>Actual material cost</span><b>${fmt(cost, 'CURRENCY')}</b></div>
+        <div class="kpi"><span>Stages left</span><b>${o.stagesLeft} / ${o.stages.length}</b></div>
+      </div>
+      <div class="bar">
+        ${can('BOM', 'C') ? `<button onclick="go('doc:BOM',{header:{PROJECT_ID:'${p.PROJECT_ID}'}})">+ BOM / revision</button>` : ''}
+        ${can('ALLOCATION', 'C') ? `<button class="primary" onclick="Actions.planBom('${p.PROJECT_ID}')">Plan BOM: reserve stock + raise PR</button>` : ''}
+        ${can('SITE_REQUEST', 'C') ? `<button onclick="go('doc:MR',{header:{PROJECT_ID:'${p.PROJECT_ID}'}})">+ Material request</button>` : ''}
+        ${can('PROJECT', 'C') && !o.stages.length ? `<button onclick="Actions.run('createStagePlan',{PROJECT_ID:'${p.PROJECT_ID}'},()=>go('project:${p.PROJECT_ID}'))">Create stage plan</button>` : ''}
+        <span class="grow"></span>
+        <button onclick="Actions.rebuild('${p.PROJECT_ID}')">⟳ Refresh tracker</button>
+        ${can('CLOSURE', 'C') ? `<button onclick="Actions.run('prepareClosure',{PROJECT_ID:'${p.PROJECT_ID}'},r=>UI.toast('Closure '+r.CLOSURE_STATUS+' – see Project closures'))">Prepare closure</button>` : ''}
+      </div>
+      <div class="stagebar">${o.stages.map(s => `<div class="${String(s.STAGE_STATUS).replace(/ /g, '_')}" title="${esc(s.STAGE_NAME)}"><b>${esc(s.STAGE_CODE)}</b>${esc(s.STAGE_STATUS)} · ${Number(s.PROGRESS_PCT) || 0}%</div>`).join('')}</div>
+      <div class="card"><h3>Stage plan</h3><div class="tbl-wrap"><table><thead><tr><th>Stage</th><th>Planned</th><th>Actual</th><th>BOM cost</th><th>Actual cost</th><th>Status</th><th>Progress %</th><th></th></tr></thead><tbody>
+        ${o.stages.map(s => `<tr data-id="${s.PROJECT_STAGE_ID}"><td><b>${esc(s.STAGE_CODE)}</b> ${esc(s.STAGE_NAME)}</td><td>${esc(s.PLANNED_START)} → ${esc(s.PLANNED_END)}</td><td>${esc(s.ACTUAL_START)} → ${esc(s.ACTUAL_END)}</td>
+          <td class="num">${fmt(s.BOM_COST, 'CURRENCY')}</td><td class="num">${fmt(s.ACTUAL_COST, 'CURRENCY')}</td>
+          <td><select data-name="STAGE_STATUS">${statuses.map(x => `<option ${x === s.STAGE_STATUS ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></td>
+          <td style="width:90px"><input type="number" data-name="PROGRESS_PCT" value="${esc(s.PROGRESS_PCT)}"></td>
+          <td>${can('PROJECT', 'E') ? `<button onclick="Actions.saveStage(this)">Save</button>` : ''}</td></tr>`).join('')}
+      </tbody></table></div></div>
+      <div class="card"><h3>BOM vs actual – what is left per stage</h3><p class="hint">BALANCE TO ISSUE = BOM gross − (issued − returned). SITE BALANCE = material still lying at site. Refresh to recalculate.</p>
+        ${table(LIST_COLS.RPT_BOM_VS_ACTUAL.slice(1), o.tracker, { sheet: 'RPT_BOM_VS_ACTUAL', empty: 'approve a BOM, then refresh' })}</div>`);
+  }
+};
+
+function setVal(e, name, v) {
+  if (e.dataset.list) { const o = (optionsFor({ n: name, ref: e.getAttribute('list').slice(3), t: 'TEXT' }) || []).find(x => String(x.v) === String(v)); e.value = o ? o.l : v; }
+  else e.value = v;
+}
+
+/* ---------------------------------------------------------------- actions */
+const Actions = {
+  async run(action, payload, then) { const r = await call(action, payload); if (then) then(r); return r; },
+
+  form(sheet, rec) {
+    const def = sheetDef(sheet), isNew = !rec;
+    const cols = def.cols.filter(c => c.by !== 'SYSTEM' && AUDIT_COLS.indexOf(c.n) < 0);
+    const pkAuto = def.pk && (def.cols.find(c => c.n === def.pk) || {}).by === 'SYSTEM';
+    UI.modal((isNew ? 'New ' : 'Edit ') + sheet, `<div class="grid" id="rf">
+        ${def.pk && !isNew && pkAuto ? field({ n: def.pk, t: 'TEXT' }, rec[def.pk], { readonly: 1 }).replace('disabled', `disabled data-keep="${esc(rec[def.pk])}"`) : ''}
+        ${cols.map(c => field(c, rec ? rec[c.n] : '', { readonly: !isNew && c.n === def.pk && !pkAuto })).join('')}</div>
+      <div class="bar" style="margin-top:14px">
+        ${sheet === 'MST_USER' && !isNew ? `<button id="rfReset">Reset password</button>` : ''}
+        <span class="grow"></span><button onclick="UI.close()">Cancel</button><button class="primary" id="rfSave">Save</button></div>`);
+    linkCategory($('#rf'));
+    if ($('#rfReset')) $('#rfReset').onclick = async () => {
+      if (!confirm('Create a new temporary password for ' + rec.EMAIL + '?')) return;
+      const r = await call('resetPassword', { USER_ID: rec.USER_ID });
+      UI.modal('Temporary password', `<p>Give this password to <b>${esc(r.EMAIL)}</b>. They should change it after logging in (top right → Change password).</p>
+        <p style="font-size:22px;font-weight:700;letter-spacing:1px">${esc(r.tempPassword)}</p>`);
+    };
+    $('#rfSave').onclick = async () => {
+      const record = collect($('#rf'));
+      if (!isNew && def.pk) record[def.pk] = rec[def.pk];
+      const saved = await call('saveRecord', { sheet, record, row: !isNew && !def.pk ? rec._row : '' });
+      UI.toast(sheet === 'MST_PRODUCT' && isNew ? 'Product "' + saved.PRODUCT_NAME + '" added – it is now in every product list' : 'Saved'); UI.close();
+      if (sheet.indexOf('MST_') === 0 || sheet.indexOf('SYS_') === 0) await boot(true);
+      if (Screens._ls && Screens._ls.sheet === sheet) Screens.reloadList();
+    };
+  },
+
+  /** Open a record: documents show header + lines + workflow buttons; masters open the edit form. */
+  async open(sheet, id, row) {
+    if (EDITABLE.indexOf(sheet) >= 0 && sheet !== 'PRJ_PROJECT') {
+      if (can(sheetDef(sheet).module, 'E')) return Actions.form(sheet, row || (await call('getDoc', { sheet, id })).header);
+    }
+    if (DOC_SHEETS.indexOf(sheet) < 0) return Actions.showRow(sheet, row || (await call('getDoc', { sheet, id })).header);
+    const d = await call('getDoc', { sheet, id }), h = d.header, def = sheetDef(sheet);
+    const lineCols = d.lineSheet ? sheetDef(d.lineSheet).cols.map(c => c.n).filter(n => AUDIT_COLS.indexOf(n) < 0 && n !== def.pk && n !== 'PROJECT_ID') : [];
+    UI.modal(`${sheet} · ${id}`, `<div class="kv">${def.cols.filter(c => AUDIT_COLS.indexOf(c.n) < 0 && h[c.n] !== '' && h[c.n] !== undefined)
+        .map(c => `<div><span>${esc(c.n.replace(/_/g, ' '))}</span>${isStatusCol(c.n) ? chip(h[c.n]) : fmt(h[c.n], c.t)}</div>`).join('')}</div>
+      <div class="bar" id="dact">${Actions.docButtons(sheet, h)}</div>
+      ${d.lineSheet ? table(lineCols, d.lines, { sheet: d.lineSheet }) : ''}
+      ${d.extra && d.extra.quotes && d.extra.quotes.length ? '<h3>Quotations</h3>' + table(['QUOTE_ID', 'SUPPLIER_ID', 'PRODUCT_ID', 'QUOTED_QTY', 'QUOTED_RATE', 'GST_PCT', 'LEAD_TIME_DAYS', 'IS_SELECTED'], d.extra.quotes, { sheet: 'PUR_QUOTATION',
+        actions: q => q.IS_SELECTED === 'Y' ? '' : `<button onclick="Actions.run('selectQuote',{QUOTE_ID:'${q.QUOTE_ID}'},()=>Actions.open('PUR_PR','${id}'))">Select</button>` }) : ''}`);
+    Actions._doc = { sheet, h, lines: d.lines };
+  },
+
+  docButtons(sheet, h) {
+    const b = [], st = h.BOM_STATUS || h.PR_STATUS || h.PO_STATUS || h.MR_STATUS || h.ISSUE_STATUS || h.TRANSFER_STATUS || '';
+    const ap = (doc, id) => `<button class="primary" onclick="Actions.approve('${doc}','${id}',true)">Approve</button><button class="danger" onclick="Actions.approve('${doc}','${id}',false)">Reject</button>`;
+    if (sheet === 'BOM_HEADER') {
+      if (['DRAFT', 'REJECTED'].indexOf(st) >= 0) b.push(`<button onclick="Actions.editBom('${h.BOM_ID}')">Edit lines</button><button class="primary" onclick="Actions.run('submitBom',{BOM_ID:'${h.BOM_ID}'},()=>{UI.close();UI.toast('Submitted for approval')})">Submit for approval</button>`);
+      if (st === 'SUBMITTED') b.push(ap('BOM', h.BOM_ID));
+      if (st === 'APPROVED' && h.IS_CURRENT === 'Y') b.push(`<button class="primary" onclick="Actions.planBom('${h.PROJECT_ID}')">Plan: reserve stock + raise PR</button>`);
+    }
+    if (sheet === 'PUR_PR') {
+      if (st === 'PENDING APPROVAL') b.push(ap('PR', h.PR_ID));
+      if (['APPROVED', 'PARTIALLY ORDERED'].indexOf(st) >= 0) b.push(`<button onclick="UI.close();go('act:QUOTE')">+ Quotation</button><button class="primary" onclick="UI.close();go('doc:PO',{header:{PROJECT_ID:'${h.PROJECT_ID || ''}'}})">Create PO</button>`);
+    }
+    if (sheet === 'PUR_PO') {
+      if (st === 'PENDING APPROVAL') b.push(ap('PO', h.PO_ID));
+      if (st === 'APPROVED') b.push(`<button onclick="Actions.run('markPoSent',{PO_ID:'${h.PO_ID}'},()=>{UI.close();UI.toast('Marked as sent')})">Mark sent</button>`);
+      if (['APPROVED', 'SENT TO SUPPLIER', 'PARTIALLY RECEIVED'].indexOf(st) >= 0) b.push(`<button class="primary" onclick="UI.close();go('doc:GRN',{header:{PO_ID:'${h.PO_ID}'},autoload:1})">Receive (GRN)</button>`);
+      if (['PENDING APPROVAL', 'APPROVED', 'SENT TO SUPPLIER'].indexOf(st) >= 0) b.push(`<button class="danger" onclick="Actions.cancelPo('${h.PO_ID}')">Cancel PO</button>`);
+    }
+    if (sheet === 'SITE_MR') {
+      if (st === 'SUBMITTED') b.push(ap('MR', h.MR_ID));
+      if (['APPROVED', 'PARTIALLY ISSUED'].indexOf(st) >= 0) b.push(`<button class="primary" onclick="UI.close();go('doc:ISSUE',{header:{MR_ID:'${h.MR_ID}'},autoload:1})">Issue material</button>`);
+    }
+    if (sheet === 'SITE_ISSUE') {
+      if (st === 'ISSUED') b.push(`<button onclick="Actions.run('acknowledgeIssue',{ISSUE_ID:'${h.ISSUE_ID}'},()=>{UI.close();UI.toast('Acknowledged')})">Site acknowledged</button>`);
+      b.push(`<button onclick="UI.close();go('doc:RETURN',{header:{PROJECT_ID:'${h.PROJECT_ID}',STAGE_CODE:'${h.STAGE_CODE}'},autoload:1})">Return material</button>`);
+    }
+    if (sheet === 'INV_TRANSFER' && st === 'IN TRANSIT') b.push(`<button class="primary" onclick="UI.close();go('doc:RECEIVE_TRANSFER',{header:{TRANSFER_ID:'${h.TRANSFER_ID}'},autoload:1})">Receive</button>`);
+    b.push(`<span class="grow"></span><button onclick="Actions.print()">Print</button>`);
+    return b.join('');
+  },
+
+  showRow(sheet, r) {
+    const def = sheetDef(sheet), b = [];
+    if (sheet === 'PRJ_ALLOCATION' && ['ACTIVE', 'PARTIALLY CONSUMED'].indexOf(r.ALLOCATION_STATUS) >= 0) b.push(`<button onclick="Actions.run('releaseAllocation',{ALLOCATION_ID:'${r.ALLOCATION_ID}'},()=>{UI.close();Screens.reloadList()})">Release open qty</button>`);
+    if (sheet === 'SITE_WASTAGE' && r.WASTE_STATUS === 'PENDING') b.push(`<button class="primary" onclick="Actions.approve('WASTAGE','${r.WASTE_ID}',true)">Approve</button><button class="danger" onclick="Actions.approve('WASTAGE','${r.WASTE_ID}',false)">Reject</button>`);
+    if (sheet === 'INV_ADJUSTMENT' && r.ADJ_STATUS === 'PENDING') b.push(`<button class="primary" onclick="Actions.approve('ADJUSTMENT','${r.ADJ_ID}',true)">Approve</button><button class="danger" onclick="Actions.approve('ADJUSTMENT','${r.ADJ_ID}',false)">Reject</button>`);
+    if (sheet === 'PRJ_CLOSURE' && r.CLOSURE_STATUS === 'PENDING APPROVAL') b.push(`<button class="primary" onclick="Actions.approve('CLOSURE','${r.CLOSURE_ID}',true)">Approve & close project</button>`);
+    if (sheet === 'PUR_QUOTATION' && r.IS_SELECTED !== 'Y') b.push(`<button onclick="Actions.run('selectQuote',{QUOTE_ID:'${r.QUOTE_ID}'},()=>{UI.close();Screens.reloadList()})">Select this quote</button>`);
+    if (sheet === 'PUR_RETURN') (B.lookups.RTV_STATUS || []).filter(s => s !== r.RTV_STATUS).forEach(s => b.push(`<button onclick="Actions.run('updateRtvStatus',{RTV_ID:'${r.RTV_ID}',RTV_STATUS:'${s}'},()=>{UI.close();Screens.reloadList()})">→ ${esc(s)}</button>`));
+    if (sheet === 'PRJ_STAGE') b.push(`<button onclick="UI.close();go('project:${r.PROJECT_ID}')">Open project</button>`);
+    UI.modal(sheet + (def.pk ? ' · ' + r[def.pk] : ''), `<div class="kv">${def.cols.map(c => `<div><span>${esc(c.n.replace(/_/g, ' '))}</span>${isStatusCol(c.n) && r[c.n] ? chip(r[c.n]) : fmt(r[c.n], c.t)}</div>`).join('')}</div><div class="bar">${b.join('')}</div>`);
+  },
+
+  async approve(doc, id, ok) {
+    let reason = '';
+    if (!ok) { reason = prompt('Reason for rejection'); if (!reason) return; }
+    await call('approve', { doc, id, approve: ok, reason });
+    UI.toast(doc + ' ' + id + (ok ? ' approved' : ' rejected'));
+    UI.close();
+    if ($('#title').textContent === 'My approvals') Screens.approvals(); else if (Screens._ls) Screens.reloadList();
+  },
+  async planBom(pid) {
+    if (!confirm('Reserve free stock for ' + pid + ' and raise a PR for the shortage?')) return;
+    const r = await call('planBom', { PROJECT_ID: pid });
+    UI.close();
+    UI.toast(`Allocated ${r.allocated} line(s); PR lines ${r.prLines}${r.PR_ID ? ' → ' + r.PR_ID : ''}`);
+  },
+  async editBom(bomId) {
+    const d = await call('getDoc', { sheet: 'BOM_HEADER', id: bomId });
+    UI.close();
+    go('doc:BOM', { header: d.header, items: d.lines });
+  },
+  async cancelPo(poId) {
+    const reason = prompt('Reason for cancelling ' + poId); if (!reason) return;
+    await call('cancelPo', { PO_ID: poId, reason }); UI.close(); UI.toast('PO cancelled'); if (Screens._ls) Screens.reloadList();
+  },
+  async saveStage(btn) {
+    const tr = btn.closest('tr'), v = collect(tr);
+    await call('updateStage', Object.assign({ PROJECT_STAGE_ID: tr.dataset.id }, v));
+    UI.toast('Stage updated');
+  },
+  async syncLeads() { const r = await call('syncLeads'); UI.toast(`Leads synced: ${r.inserted} new, ${r.updated} updated`); await boot(true); Screens.reloadList(); },
+  async rebuild(pid) { const r = await call('rebuildReports'); UI.toast(`Reports rebuilt (${r.rows} rows, ${r.seconds}s)`); if (pid) go('project:' + pid); else if (Screens._ls) Screens.reloadList(); },
+  print() {
+    const w = window.open('', '_blank');
+    w.document.write(`<html><head><title>${esc($('#mtitle').textContent)}</title><style>body{font:13px Arial;padding:24px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:5px;text-align:left}.kv{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:14px}.kv span{display:block;color:#666;font-size:10px}button,.bar{display:none}</style></head><body><h2>${esc(B.config.COMPANY_NAME || '')}</h2><h3>${esc($('#mtitle').textContent)}</h3>${$('#mbody').innerHTML}</body></html>`);
+    w.document.close(); w.focus(); w.print();
+  }
+};
+
+/* ---------------------------------------------------------------- boot */
+async function boot(silent) {
+  B = await call('bootstrap', {}, !!silent);
+  $('#brandName').textContent = B.config.COMPANY_NAME && B.config.COMPANY_NAME.indexOf('Your Company') < 0 ? B.config.COMPANY_NAME : B.app;
+  $('#who').innerHTML = `<b>${esc(B.user.FULL_NAME)}</b> · ${esc(B.user.ROLE)}<br>
+    <a href="#" onclick="Auth.changePassword();return false">Change password</a> · <a href="#" onclick="Auth.logout();return false">Logout</a>`;
+  $$('datalist').forEach(d => d.remove());
+  renderMenu();
+  refreshDatalists();
+}
+/* ---------------------------------------------------------------- login / registration */
+const Auth = {
+  shell(inner) {
+    document.body.classList.add('auth');
+    UI.close();
+    $('#view').innerHTML = `<div class="authwrap"><div class="authcard"><div class="authbrand"><span class="logo">▣</span> Inventory Management System</div>${inner}</div></div>`;
+  },
+  show(msg, email) {
+    Auth.shell(`<h2>Log in</h2>${msg ? `<p class="authmsg">${esc(msg)}</p>` : ''}
+      <div class="fld"><label>Email</label><input id="lgEmail" type="email" autocomplete="username" value="${esc(email || '')}"></div>
+      <div class="fld"><label>Password</label><input id="lgPass" type="password" autocomplete="current-password" onkeydown="if(event.key==='Enter')Auth.login()"></div>
+      <button class="primary wide" onclick="Auth.login()">Log in</button>
+      <p class="authalt">New user? <a href="#" onclick="Auth.showRegister();return false">Create an account</a></p>
+      <p class="hint">Forgot your password? Ask the admin to reset it.</p>`);
+    setTimeout(() => { const e = $(email ? '#lgPass' : '#lgEmail'); if (e) e.focus(); }, 50);
+  },
+  expired(msg) { Store.clear(); B = null; forgetSeen(); Auth.show(msg); },
+  async login() {
+    const r = await call('login', { EMAIL: $('#lgEmail').value.trim(), PASSWORD: $('#lgPass').value });
+    Store.set(r.token);
+    await start();
+  },
+  async showRegister() {
+    let o = { roles: [], departments: [] };
+    try { o = await call('registerOptions', {}); } catch (e) { }
+    const sel = (id, list) => `<select id="${id}"><option value=""></option>${list.map(x => `<option>${esc(x)}</option>`).join('')}</select>`;
+    Auth.shell(`<h2>Create an account</h2>
+      <div class="fld"><label>Full name *</label><input id="rgName"></div>
+      <div class="fld"><label>Email *</label><input id="rgEmail" type="email" autocomplete="username"></div>
+      <div class="fld"><label>Phone</label><input id="rgPhone"></div>
+      <div class="grid2"><div class="fld"><label>Department</label>${sel('rgDept', o.departments)}</div>
+        <div class="fld"><label>Role requested</label>${sel('rgRole', o.roles)}</div></div>
+      <div class="grid2"><div class="fld"><label>Password *</label><input id="rgPass" type="password" autocomplete="new-password"></div>
+        <div class="fld"><label>Confirm password *</label><input id="rgPass2" type="password" autocomplete="new-password"></div></div>
+      <p class="hint">At least 6 characters with letters and numbers. The admin approves new accounts.</p>
+      <button class="primary wide" onclick="Auth.register()">Register</button>
+      <p class="authalt">Already registered? <a href="#" onclick="Auth.show();return false">Log in</a></p>`);
+  },
+  async register() {
+    if ($('#rgPass').value !== $('#rgPass2').value) return UI.toast('Passwords do not match', true);
+    const email = $('#rgEmail').value.trim();
+    const r = await call('register', { FULL_NAME: $('#rgName').value.trim(), EMAIL: email, PHONE: $('#rgPhone').value.trim(),
+      DEPARTMENT: $('#rgDept').value, ROLE: $('#rgRole').value, PASSWORD: $('#rgPass').value });
+    Auth.show(r.message, email);
+  },
+  async logout() {
+    try { await call('logout', {}, true); } catch (e) { }
+    Store.clear(); B = null; forgetSeen();
+    Auth.show('You have been logged out.');
+  },
+  changePassword() {
+    UI.modal('Change password', `<div class="grid" id="cp">
+        <div class="fld"><label>Current password</label><input type="password" id="cpOld"></div>
+        <div class="fld"><label>New password</label><input type="password" id="cpNew"></div>
+        <div class="fld"><label>Confirm new password</label><input type="password" id="cpNew2"></div></div>
+      <div class="bar" style="margin-top:14px"><span class="grow"></span><button class="primary" id="cpSave">Change password</button></div>`);
+    $('#cpSave').onclick = async () => {
+      if ($('#cpNew').value !== $('#cpNew2').value) return UI.toast('New passwords do not match', true);
+      await call('changePassword', { OLD_PASSWORD: $('#cpOld').value, NEW_PASSWORD: $('#cpNew').value });
+      UI.close(); UI.toast('Password changed');
+    };
+  }
+};
+
+/** Start the app for a logged-in user. */
+async function start() {
+  document.body.classList.remove('auth');
+  $('#view').innerHTML = '<div class="loading">Loading your workspace…</div>';
+  Screens._cur = 'dashboard';
+  const firstDash = call('dashboard', {}, true).then(d => { SEEN.set('dashboard|{}', { data: d, json: JSON.stringify(d) }); return d; }, () => null);
+  await boot();
+  const d = await firstDash;
+  if (d && Screens._cur === 'dashboard') Screens.renderDashboard(d); else if (Screens._cur === 'dashboard') go('dashboard');
+  setTimeout(() => call('warm', {}, true).catch(() => {}), 1500);   // pre-load all modules in the background
+}
+
+if (Store.get()) start().catch(e => { if (!(e && e.auth)) $('#view').innerHTML = `<div class="card"><h3>Cannot start</h3><p>${esc(e && (e.error || e.message) || e)}</p></div>`; });
+else Auth.show();
+</script>
